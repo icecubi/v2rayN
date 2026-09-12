@@ -3,7 +3,7 @@ using System.Net.Http.Headers;
 namespace ServiceLib.Services;
 
 /// <summary>
-///Download
+/// Download
 /// </summary>
 public class DownloadService
 {
@@ -11,9 +11,16 @@ public class DownloadService
 
     public event ErrorEventHandler? Error;
 
+    public string? AcceptHeader { get; init; }
+
+    public IReadOnlyDictionary<string, string>? RequestHeaders { get; init; }
+
     private static readonly string _tag = "DownloadService";
 
-    public async Task<int> DownloadDataAsync(string url, WebProxy webProxy, int downloadTimeout, Func<bool, string, Task> updateFunc)
+    /// <summary>
+    /// Downloads data with the specified proxy and reports progress messages.
+    /// </summary>
+    public async Task<int> DownloadDataAsync(string url, IWebProxy webProxy, int downloadTimeout, Func<bool, string, Task> updateFunc)
     {
         try
         {
@@ -36,21 +43,25 @@ public class DownloadService
         return 0;
     }
 
-    public async Task DownloadFileAsync(string url, string fileName, bool blProxy, int downloadTimeout)
+    /// <summary>
+    /// Downloads a file and reports progress through events.
+    /// </summary>
+    public async Task DownloadFileAsync(FileDownloadRequest request, bool blProxy, TimeSpan connectTimeout)
     {
         try
         {
-            UpdateCompleted?.Invoke(this, new UpdateResult(false, $"{ResUI.Downloading}   {url}"));
-
-            var progress = new Progress<double>();
-            progress.ProgressChanged += (sender, value) => UpdateCompleted?.Invoke(this, new UpdateResult(value > 100, $"...{value}%"));
+            UpdateCompleted?.Invoke(this, new UpdateResult(false, $"{ResUI.Downloading}   {request.FileUrl}"));
 
             var webProxy = await GetWebProxy(blProxy);
             await DownloaderHelper.Instance.DownloadFileAsync(webProxy,
-                url,
-                fileName,
-                progress,
-                downloadTimeout);
+                request,
+                OnProgress,
+                connectTimeout);
+
+            void OnProgress(FileDownloadState state)
+            {
+                UpdateCompleted?.Invoke(this, new UpdateResult(state.Completed, $"{Utils.HumanFy((long)state.SpeedBytesPerSecond / 1024)}/s | {Utils.HumanFy(state.DownloadedBytes / 1024)}/{Utils.HumanFy(state.TotalBytes / 1024)}"));
+            }
         }
         catch (Exception ex)
         {
@@ -64,6 +75,75 @@ public class DownloadService
         }
     }
 
+    public async Task DownloadSmallFilesAsync(List<FileDownloadRequest> requests, bool blProxy, TimeSpan connectTimeout)
+    {
+        try
+        {
+            UpdateCompleted?.Invoke(this, new UpdateResult(false, $"{ResUI.Downloading} 0/{requests.Count}"));
+
+            var webProxy = await GetWebProxy(blProxy);
+            await DownloaderHelper.Instance.DownloadSmallFilesAsync(webProxy,
+                requests,
+                OnProgress,
+                connectTimeout);
+
+            void OnProgress(ReadOnlyMemory<FileDownloadState> states)
+            {
+                var span = states.Span;
+                var completedCount = 0;
+                var downloadingStates = new List<FileDownloadState>();
+                foreach (ref readonly var item in span)
+                {
+                    if (item.Completed)
+                    {
+                        completedCount++;
+                    }
+                    else if (item.TotalBytes > 0)
+                    {
+                        downloadingStates.Add(item);
+                    }
+                }
+                var totalSpeed = downloadingStates.Sum(x => x.SpeedBytesPerSecond);
+                var totalDownloadedBytes = downloadingStates.Sum(x => x.DownloadedBytes);
+                var totalTotalBytes = downloadingStates.Sum(x => x.TotalBytes);
+                var downloadingFileName = string.Join(", ", downloadingStates.Select(x => x.Request.FileName));
+                var allCompleted = completedCount == span.Length;
+                if (allCompleted)
+                {
+                    // check and throw errors if any
+                    FileDownloadState? failedState = null;
+                    foreach (ref readonly var item in span)
+                    {
+                        if (!item.IsFailed)
+                        {
+                            continue;
+                        }
+                        failedState = item;
+                        break;
+                    }
+                    if (failedState?.Error != null)
+                    {
+                        throw failedState.Error;
+                    }
+                }
+                UpdateCompleted?.Invoke(this, new UpdateResult(allCompleted, $"{completedCount}/{span.Length} | {Utils.HumanFy((long)totalSpeed / 1024)}/s {Utils.HumanFy(totalDownloadedBytes / 1024)}/{Utils.HumanFy(totalTotalBytes / 1024)} {downloadingFileName}"));
+            }
+        }
+        catch (Exception ex)
+        {
+            Logging.SaveLog(_tag, ex);
+
+            Error?.Invoke(this, new ErrorEventArgs(ex));
+            if (ex.InnerException != null)
+            {
+                Error?.Invoke(this, new ErrorEventArgs(ex.InnerException));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets redirect target URL without following redirects automatically.
+    /// </summary>
     public async Task<string?> UrlRedirectAsync(string url, bool blProxy)
     {
         var webRequestHandler = new SocketsHttpHandler
@@ -71,7 +151,13 @@ public class DownloadService
             AllowAutoRedirect = false,
             Proxy = await GetWebProxy(blProxy)
         };
-        var client = new HttpClient(webRequestHandler);
+        var certificateChainPolicy = CertPemManager.Instance.BuildCertificateChainPolicy();
+        if (certificateChainPolicy != null)
+        {
+            webRequestHandler.SslOptions.CertificateChainPolicy = certificateChainPolicy;
+            webRequestHandler.SslOptions.RemoteCertificateValidationCallback = null;
+        }
+        using var client = new HttpClient(webRequestHandler);
 
         var response = await client.GetAsync(url);
         if (response.StatusCode == HttpStatusCode.Redirect && response.Headers.Location is not null)
@@ -86,11 +172,24 @@ public class DownloadService
         }
     }
 
+    /// <summary>
+    /// Tries to download string content using proxy switch setting.
+    /// </summary>
     public async Task<string?> TryDownloadString(string url, bool blProxy, string userAgent)
     {
+        var webProxy = await GetWebProxy(blProxy);
+        return await TryDownloadString(url, webProxy, userAgent);
+    }
+
+    /// <summary>
+    /// Tries to download string content with a specified proxy.
+    /// </summary>
+    public async Task<string?> TryDownloadString(string url, IWebProxy? webProxy, string userAgent)
+    {
+        var timeout = 15;
         try
         {
-            var result1 = await DownloadStringAsync(url, blProxy, userAgent, 15);
+            var result1 = await DownloadStringAsync(url, webProxy, userAgent, timeout);
             if (result1.IsNotEmpty())
             {
                 return result1;
@@ -108,7 +207,7 @@ public class DownloadService
 
         try
         {
-            var result2 = await DownloadStringViaDownloader(url, blProxy, userAgent, 15);
+            var result2 = await DownloadStringViaDownloader(url, webProxy, userAgent, timeout);
             if (result2.IsNotEmpty())
             {
                 return result2;
@@ -128,25 +227,41 @@ public class DownloadService
     }
 
     /// <summary>
-    /// DownloadString
+    /// Downloads string content via HttpClient.
     /// </summary>
-    /// <param name="url"></param>
-    private async Task<string?> DownloadStringAsync(string url, bool blProxy, string userAgent, int timeout)
+    private async Task<string?> DownloadStringAsync(string url, IWebProxy? webProxy, string userAgent, int timeout)
     {
         try
         {
-            var webProxy = await GetWebProxy(blProxy);
-            var client = new HttpClient(new SocketsHttpHandler()
+            var connectTimeout = Math.Clamp(timeout / 5, 2, 5);
+            var handler = new SocketsHttpHandler
             {
                 Proxy = webProxy,
-                UseProxy = webProxy != null
-            });
+                UseProxy = webProxy != null,
+                AutomaticDecompression = DecompressionMethods.All,
+                ConnectTimeout = TimeSpan.FromSeconds(connectTimeout)
+            };
+            var certificateChainPolicy = CertPemManager.Instance.BuildCertificateChainPolicy();
+            if (certificateChainPolicy != null)
+            {
+                handler.SslOptions.CertificateChainPolicy = certificateChainPolicy;
+                handler.SslOptions.RemoteCertificateValidationCallback = null;
+            }
+
+            using var client = new HttpClient(HttpRequestHeadersHelper.CreateHandler(handler, RequestHeaders))
+            {
+                Timeout = Timeout.InfiniteTimeSpan
+            };
 
             if (userAgent.IsNullOrEmpty())
             {
                 userAgent = Utils.GetVersion(false);
             }
             client.DefaultRequestHeaders.UserAgent.TryParseAdd(userAgent);
+            if (AcceptHeader.IsNotEmpty())
+            {
+                client.DefaultRequestHeaders.Accept.ParseAdd(AcceptHeader);
+            }
 
             Uri uri = new(url);
             //Authorization Header
@@ -156,7 +271,35 @@ public class DownloadService
             }
 
             using var cts = new CancellationTokenSource();
-            var result = await client.GetStringAsync(url, cts.Token).WaitAsync(TimeSpan.FromSeconds(timeout), cts.Token);
+            cts.CancelAfter(TimeSpan.FromSeconds(timeout));
+
+            return await client.GetStringAsync(url, cts.Token);
+        }
+        catch (Exception ex)
+        {
+            Logging.SaveLog(_tag, ex);
+            Error?.Invoke(this, new ErrorEventArgs(ex));
+            if (ex.InnerException != null)
+            {
+                Error?.Invoke(this, new ErrorEventArgs(ex.InnerException));
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Downloads string content via DownloaderHelper.
+    /// </summary>
+    private async Task<string?> DownloadStringViaDownloader(string url, IWebProxy? webProxy, string userAgent, int timeout)
+    {
+        try
+        {
+            if (userAgent.IsNullOrEmpty())
+            {
+                userAgent = Utils.GetVersion(false);
+            }
+            var result = await DownloaderHelper.Instance.DownloadStringAsync(webProxy, url, userAgent, timeout, RequestHeaders, AcceptHeader);
             return result;
         }
         catch (Exception ex)
@@ -172,34 +315,8 @@ public class DownloadService
     }
 
     /// <summary>
-    /// DownloadString
+    /// Creates local SOCKS proxy when proxy switch is enabled.
     /// </summary>
-    /// <param name="url"></param>
-    private async Task<string?> DownloadStringViaDownloader(string url, bool blProxy, string userAgent, int timeout)
-    {
-        try
-        {
-            var webProxy = await GetWebProxy(blProxy);
-
-            if (userAgent.IsNullOrEmpty())
-            {
-                userAgent = Utils.GetVersion(false);
-            }
-            var result = await DownloaderHelper.Instance.DownloadStringAsync(webProxy, url, userAgent, timeout);
-            return result;
-        }
-        catch (Exception ex)
-        {
-            Logging.SaveLog(_tag, ex);
-            Error?.Invoke(this, new ErrorEventArgs(ex));
-            if (ex.InnerException != null)
-            {
-                Error?.Invoke(this, new ErrorEventArgs(ex.InnerException));
-            }
-        }
-        return null;
-    }
-
     private async Task<WebProxy?> GetWebProxy(bool blProxy)
     {
         if (!blProxy)
@@ -215,6 +332,9 @@ public class DownloadService
         return new WebProxy($"socks5://{Global.Loopback}:{port}");
     }
 
+    /// <summary>
+    /// Checks whether the specified TCP endpoint is reachable.
+    /// </summary>
     private async Task<bool> SocketCheck(string ip, int port)
     {
         try

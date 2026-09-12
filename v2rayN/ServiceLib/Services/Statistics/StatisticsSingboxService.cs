@@ -17,7 +17,11 @@ public class StatisticsSingboxService
         _updateFunc = updateFunc;
         _exitFlag = false;
 
-        _ = Task.Run(Run);
+        _ = Task.Factory.StartNew(
+            Run,
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
     }
 
     private async Task Init()
@@ -61,7 +65,7 @@ public class StatisticsSingboxService
             await Task.Delay(1000);
             try
             {
-                if (!_config.IsRunningCore(ECoreType.sing_box))
+                if (!AppManager.Instance.IsRunningCore(ECoreType.sing_box))
                 {
                     continue;
                 }

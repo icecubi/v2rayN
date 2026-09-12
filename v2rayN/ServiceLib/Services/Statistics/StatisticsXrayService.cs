@@ -15,7 +15,11 @@ public class StatisticsXrayService
         _updateFunc = updateFunc;
         _exitFlag = false;
 
-        _ = Task.Run(Run);
+        _ = Task.Factory.StartNew(
+            Run,
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
     }
 
     public void Close()
@@ -30,7 +34,7 @@ public class StatisticsXrayService
             await Task.Delay(1000);
             try
             {
-                if (_config.RunningCoreType != ECoreType.Xray)
+                if (AppManager.Instance.RunningCoreType != ECoreType.Xray)
                 {
                     continue;
                 }
